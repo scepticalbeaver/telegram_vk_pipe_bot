@@ -17,7 +17,7 @@ class User(object):
 	def __str__(self):
 		seen_str = dt.datetime.fromtimestamp(self.last_seen).strftime('%Y-%m-%d %H:%M:%S')
 
-		return "User: ({0}, id: {1}, last_seen: {2}, want_time: {3}, muted: {4})".format(self.name, self.id, seen_str,
-				self.want_time, self.muted)
+		return "User: ({0}, id: {1}, last_seen: {2}, want_time: {3}, muted: {4})".format(self.name.encode('utf-8'),
+				self.id, seen_str, self.want_time, self.muted)
 
 
