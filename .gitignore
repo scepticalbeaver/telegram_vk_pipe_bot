@@ -1,3 +1,5 @@
 .idea
 _token
 vk_credits
+.codec-*
+*.pyc

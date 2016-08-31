@@ -9,20 +9,21 @@ class DBClient(object):
 	DB_NAME = 'ip_sink_data.db'
 
 	def __init__(self):
-		if os._exists(DBClient.DB_NAME):
-			logging.info("Connecting to %s ...", DBClient.DB_NAME)
-			self.conn = sqlite3.connect(DBClient.DB_NAME)
-		else:
-			logging.info("%s doesn't exist. Creating new one ...")
+		have_saved_data = os.path.isfile(self.DB_NAME)
+		self.conn = sqlite3.connect(DBClient.DB_NAME)
+		if not have_saved_data:
+			logging.info("%s doesn't exist. Creating new one ...", self.DB_NAME)
 			self.create_fresh_db()
+		logging.info("Connecting to %s ...", DBClient.DB_NAME)
+
 
 	def create_fresh_db(self):
 		c = self.conn.cursor()
 
 		try:
-			c.execute('''DROP TABLE  users''')
-			c.execute('''DROP TABLE  messages''')
-			c.execute('''DROP TABLE  msg_pipe''')
+			c.execute('''DROP TABLE users''')
+			c.execute('''DROP TABLE messages''')
+			c.execute('''DROP TABLE msg_pipe''')
 			self.conn.commit()
 		except Exception as e:
 			logging.error("Failed to drop tables. Reason: %s", e.message)
@@ -46,9 +47,11 @@ class DBClient(object):
 		              PRIMARY KEY (message_id, sender_id))''')
 
 		c.execute('''CREATE TABLE msg_pipe
-						(tg_chat_id INT NOT NULL,
-						vk_chat_id INT NOT NULL,
-						PRIMARY KEY (tg_chat_id, vk_chat_id))''')
+						(id INTEGER PRIMARY KEY AUTOINCREMENT,
+						tg_chat_id INT,
+						vk_chat_id INT,
+						is_active BOOLEAN DEFAULT 0,
+						UNIQUE (tg_chat_id, vk_chat_id))''')
 
 		self.conn.commit()
 		logging.info("Brand new tables were created")
@@ -84,7 +87,7 @@ class DBClient(object):
 
 	def add_msg_from_tg(self, msg_id, tg_chat_id, sender_id, sender_name, msg_type, content, date):
 		c = self.conn.cursor()
-		c.execute("INSERT INTO messages VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 0)", (msg_id, tg_chat_id, sender_id,
+		c.execute("INSERT INTO messages VALUES (?, ?, NULL, ?, ?, ?, ?, ?)", (msg_id, tg_chat_id, sender_id,
 			sender_name, msg_type, content, date))
 
 		self.conn.commit()
@@ -104,6 +107,17 @@ class DBClient(object):
 				c.execute("UPDATE messages SET tg_chat_id = ? WHERE message_id = ? AND sender_id = ?",
 						(d["tg_chat_id"], msg_id, sender_id))
 				self.conn.commit()
+
+	def get_monitored_chats(self, platform):
+		c = self.conn.cursor()
+		if platform == "vk":
+			chat = "vk_chat_id"
+		elif platform == "tg":
+			chat = "tg_chat_id"
+		else:
+			assert False, "unrecognized platform"
+		c.execute("SELECT " + chat + " FROM msg_pipe")
+		return c.fetchall()
 
 	def close(self):
 		self.conn.close()
