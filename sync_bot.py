@@ -1,7 +1,10 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 # Author: Ivan Senin
 
 import datetime as dt
 import logging
+from pprint import pprint
 import random
 import telepot
 import time
@@ -28,10 +31,10 @@ class SyncBot(object):
 
 		self.answerer = telepot.helper.Answerer(self.bot)
 
-		self.db_client = db_ops.DBClient()
+		self.db_client = db_ops.DBClient("tg")
 		self.users = self.db_client.fetch_users()
 		logging.info("%d users were fetched from db", len(self.users))
-		self.chats_to_monitor = self.db_client.get_monitored_chats("tg")
+		self.chats_to_monitor = self.db_client.get_monitored_chats()
 		logging.info("%d chatd_ids to monitor were fetched from db", len(self.chats_to_monitor))
 		self.msg_queue = Queue.Queue(120)
 		self.new_users_to_register = Queue.Queue(15)
@@ -51,7 +54,7 @@ class SyncBot(object):
 				incoming_msg_handler(msg_queue=self.msg_queue, db_client=self.db_client)
 				users_update_handler(users=self.users, users_mx=self.users_mx, new_users=self.new_users_to_register,
 						db_client=self.db_client)
-				unsync_messages_handler()
+				unsync_messages_handler(bot=self.bot, db_client=self.db_client)
 				time_notification(bot=self.bot, users=self.users)
 
 				time.sleep(sleep_seconds)
@@ -88,7 +91,7 @@ class SyncBot(object):
 
 				articles = [InlineQueryResultArticle(
 						id='random_quote',
-						title="Get random quote!",
+						title="Random quote!",
 						input_message_content=InputTextMessageContent(
 						message_text= quote
 						)
@@ -103,20 +106,34 @@ class SyncBot(object):
 		result_id, from_id, query_string = telepot.glance(msg, flavor='chosen_inline_result')
 		logging.info('Chosen Inline Result. result: %s\tfrom_id: %d\tquery: %s', result_id, from_id, query_string)
 
+	def send_help_message(self, chat_id):
+		text = "The synchrobot dublicates [text] messages to a chat in other platform working as a pipe. This way " \
+		       "a <i>transchat</i> is introduced. It's capable to connect people who prefer to chat in different " \
+		       "platforms\n" \
+				"Also if you add @synchrobot to your contact list, you'll be able to pick a <b>random famous " \
+		       "quote</b> in any chat via inline query technique: mention @synchrobot in the textfield and wait " \
+				"for a button!\n" \
+				"Enjoy!\n"
+
+		logging.info("Usage message is sending to %d", chat_id)
+		self.bot.sendMessage(chat_id, text, parse_mode="html")
+
 
 	def handle_private_chat(self, chat_id, msg):
 		logging.info("handling private chat")
 		is_new_user = False
 		if chat_id in self.users:
-			user = self.users[chat_id]
+			with self.users_mx:
+				user = self.users[chat_id]
 		else:
 			user = User(chat_id, msg['chat']['first_name'], 0, True, False)
-			self.users[chat_id] = user
+			with self.users_mx:
+				self.users[chat_id] = user
 			is_new_user = True
 			self.new_users_to_register.put(user)
 			logging.info("New user was created: %s ", str(user))
-		seen = dt.datetime.fromtimestamp(user.last_seen)
-		elapsed_time = dt.datetime.now() - seen
+
+		elapsed_time = dt.datetime.now() - dt.datetime.fromtimestamp(user.last_seen)
 		user.update_seen_time()
 
 		msg_text = msg['text'].split()
@@ -124,16 +141,19 @@ class SyncBot(object):
 			user.want_time = msg_text[1].lower() == "on"
 		elif msg_text[-1].lower() == "notifications":
 			user.muted = msg_text[1].lower() == "off"
-		elif is_new_user or elapsed_time.seconds > 5 * 60:
+		elif is_new_user or elapsed_time.seconds > 10 * 60:
 			greeting = random.choice(SyncBot.greetings_first if is_new_user else SyncBot.greetings_next)
 			self.bot.sendMessage(chat_id, user.name + "! " + greeting)
 			if not is_new_user:
 				self.bot.sendMessage(chat_id, "Haven't seen you for " + str(elapsed_time))
+		elif msg_text[0] == "/help":
+			self.send_help_message(chat_id)
 		switch_timer = "Switch {0} time updates".format("off" if user.want_time else "on")
 		switch_sound = "Turn {0} notifications".format("on" if user.muted else "off")
 		keyboard = ReplyKeyboardMarkup(keyboard=[
 			[switch_timer],
-			[switch_sound]
+			[switch_sound],
+			["/help"]
 		])
 		self.bot.sendMessage(chat_id, str(user), reply_markup=keyboard)
 
@@ -142,32 +162,30 @@ class SyncBot(object):
 		content_type, chat_type, chat_id = telepot.glance(msg)
 		flavor = telepot.flavor(msg)
 		logging.info("On chat message handler. Flavor: %s", flavor)
-		logging.info("Message: %s", str(msg))
+		#logging.info("Message: %s", str(msg))
+		pprint(msg)
 
-		if msg['chat']['type'] == "private" and content_type == "text":
-			self.handle_private_chat(chat_id, msg)
-		elif msg['chat']['type'] == "group" and content_type == "text":
-			self.msg_queue.put(msg)
+		if content_type == "text":
+			if chat_id in self.chats_to_monitor:
+				self.msg_queue.put(msg)
+			if chat_type == "private":
+				self.handle_private_chat(chat_id, msg)
+			if chat_type == "group" and 'entities' in msg:
+				for entity in msg['entities']:
+					if entity['type'] == "bot_command":
+						cmd = (msg["text"][entity['offset']:]).split()[0]
+						if cmd == "\help":
+							self.send_help_message()
+						else:
+							logging.info("Call for unsupported command: %s", cmd)
+							self.bot.sendMessage("Unsupported command. Work in progress. Maybe. Maybe not. :grin:")
+
+
 		else:
 			logging.warning("Unsupported message. Content type: %s\tchat type: %s", content_type, chat_type)
 
 
-class Handler(object):
-	def __init__(self):
-		self.time_to_go = dt.datetime.now()
-		self.period = None  # you must set this in inherited class
-
-	def handler_hook(self, **kwargs):
-		pass
-
-	def __call__(self, *args, **kwargs):
-		# Do not override this method. Use a hook
-		if dt.datetime.now() > self.time_to_go:
-			self.handler_hook(**kwargs)
-			self.time_to_go = dt.datetime.now() + self.period
-
-
-class ChatMessagesHandler(Handler):
+class ChatMessagesHandler(db_ops.Handler):
 	def __init__(self):
 		super(ChatMessagesHandler, self).__init__()
 		self.period = dt.timedelta(seconds=13)
@@ -179,14 +197,14 @@ class ChatMessagesHandler(Handler):
 			msg = kwargs["msg_queue"].get()
 			content_type, chat_type, chat_id = telepot.glance(msg)
 			logging.info("ChatMessagesHandler: flushing to db msg: %s", str(msg))
-			kwargs["db_client"].add_msg_from_tg(msg["message_id"], chat_id, msg["from"]["id"], msg["from"]["id"],
-					content_type, msg["text"], msg["date"])
+			kwargs["db_client"].add_msg(msg["message_id"], chat_id, msg["from"]["id"], msg["from"]["first_name"],
+					msg["from"]["username"], content_type, msg["text"], msg["date"])
 
 
-class UserUpdatesHandler(Handler):
+class UserUpdatesHandler(db_ops.Handler):
 	def __init__(self):
 		super(UserUpdatesHandler, self).__init__()
-		self.period = dt.timedelta(seconds=15)
+		self.period = dt.timedelta(seconds=25)
 
 	def handler_hook(self, **kwargs):
 		users_mx = kwargs["users_mx"]
@@ -210,16 +228,23 @@ class UserUpdatesHandler(Handler):
 						user.dirty = False
 
 
-class UnsyncMessagesHandler(Handler):
+class UnsyncMessagesHandler(db_ops.Handler):
 	def __init__(self):
 		super(UnsyncMessagesHandler, self).__init__()
-		self.period = dt.timedelta(seconds=30)
+		self.period = dt.timedelta(seconds=11)
 
 	def handler_hook(self, **kwargs):
-		logging.warning("TODO: UnsyncMessagesHandler")
+		db_client = kwargs["db_client"]
+		bot = kwargs["bot"]
+		for row_dict in db_client.fetch_unsync_messages():
+			logging.info("Sending unsync message: %s ", str(row_dict))
+			msg_time = dt.datetime.fromtimestamp(row_dict["date"]).strftime('%H:%M:%S')
+			msg_text = "{0} ({1}), {2}: {3}".format(row_dict["sender_name"].encode('utf-8'),
+					row_dict["username"].encode('utf-8'), msg_time, row_dict["content"].encode('utf-8'))
+			bot.sendMessage(row_dict["tg_chat_id"], msg_text)
 
 
-class TimeNotificationHandler(Handler):
+class TimeNotificationHandler(db_ops.Handler):
 	def __init__(self):
 		super(TimeNotificationHandler, self).__init__()
 		self.period = dt.timedelta(seconds=20)
@@ -236,7 +261,7 @@ class TimeNotificationHandler(Handler):
 
 
 if __name__ == "__main__":
-	logging.basicConfig(format='%(asctime)s %(message)s', level=logging.INFO)
+	logging.basicConfig(format='tg side: %(asctime)s %(message)s', level=logging.INFO)
 
 	token_f = open("_token")
 	_token = token_f.readline()
