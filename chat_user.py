@@ -4,10 +4,11 @@ import time
 import datetime as dt
 
 class User(object):
-	def __init__(self, id, name, last_seen, want_time, muted):
+	def __init__(self, id, name, last_seen, want_time, muted, username=""):
 		super(User, self).__init__()
 		self.id = id
 		self.name = name
+		self.username = username
 		self._last_seen = last_seen
 		self._want_time = want_time
 		self._muted = muted
@@ -41,7 +42,7 @@ class User(object):
 	def __str__(self):
 		seen_str = dt.datetime.fromtimestamp(self.last_seen).strftime('%Y-%m-%d %H:%M:%S')
 
-		return "User: ({0}, id: {1}, last_seen: {2}, want_time: {3}, muted: {4})".format(self.name.encode('utf-8'),
-				self.id, seen_str, self.want_time, self.muted)
+		return "User: ({0} ({1}), id: {2}, last_seen: {3}, want_time: {4}, muted: {5})".format(
+				self.name.encode('utf-8'), self.username, self.id, seen_str, self.want_time, self.muted)
 
 

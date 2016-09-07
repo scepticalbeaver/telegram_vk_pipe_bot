@@ -2,10 +2,11 @@
 # -*- coding: utf-8 -*-
 # Author: Ivan Senin
 
+import collections
 import datetime as dt
 import logging
-from pprint import pprint
 import random
+import string
 import telepot
 import time
 import threading
@@ -23,10 +24,11 @@ class SyncBot(object):
 
 	greetings_next = ["Hello again!", "Good to see you again!", "How's it going?", "How are you doing?", "What's up?",
                   "Pleased to meet you again!"]
+	VK_GROUP_IDS = 2000000000
 
 	def __init__(self, token):
 		assert isinstance(token, str)
-		self.bot = telepot.Bot(token)
+		self.bot = LimitsAwareBot(token)
 		logging.info("getMe request: %s", self.bot.getMe())
 
 		self.answerer = telepot.helper.Answerer(self.bot)
@@ -36,31 +38,34 @@ class SyncBot(object):
 		logging.info("%d users were fetched from db", len(self.users))
 		self.chats_to_monitor = self.db_client.get_monitored_chats()
 		logging.info("%d chatd_ids to monitor were fetched from db", len(self.chats_to_monitor))
-		self.msg_queue = Queue.Queue(120)
+		self.msg_queue = Queue.Queue()
 		self.new_users_to_register = Queue.Queue(15)
 		self.users_mx = threading.Lock()
+		self.chats_to_activate = Queue.Queue()
 
 
 	def __event_loop(self):
 		logging.info("Starting event loop")
-		incoming_msg_handler = ChatMessagesHandler()
-		users_update_handler = UserUpdatesHandler()
-		unsync_messages_handler = UnsyncMessagesHandler()
-		time_notification = TimeNotificationHandler()
+		incoming_msg_handler = ChatMessagesHandler(self.db_client)
+		users_update_handler = db_ops.UserUpdatesHandler(self.db_client, self.users)
+		unsync_messages_handler = UnsyncMessagesHandler(self.db_client, self.bot)
+		time_notification = TimeNotificationHandler(self.bot)
+		pipe_control = PipeControlHandler(self.db_client, self.chats_to_activate, self.bot)
 
 		try:
-			sleep_seconds = 1
+			sleep_seconds = 0.3
 			while True:
-				incoming_msg_handler(msg_queue=self.msg_queue, db_client=self.db_client)
-				users_update_handler(users=self.users, users_mx=self.users_mx, new_users=self.new_users_to_register,
-						db_client=self.db_client)
-				unsync_messages_handler(bot=self.bot, db_client=self.db_client)
-				time_notification(bot=self.bot, users=self.users)
+				res = pipe_control()
+				if res:
+					self.chats_to_monitor = res
+				incoming_msg_handler(msg_queue=self.msg_queue)
+				time_notification(users=self.users)
+				unsync_messages_handler()
+				users_update_handler(users_mx=self.users_mx, new_users=self.new_users_to_register)
 
 				time.sleep(sleep_seconds)
 		except KeyboardInterrupt:
 			logging.info("Event loop was interrupted by user")
-
 
 	def start(self):
 		error_counter = 0
@@ -121,6 +126,7 @@ class SyncBot(object):
 
 	def handle_private_chat(self, chat_id, msg):
 		logging.info("handling private chat")
+
 		is_new_user = False
 		if chat_id in self.users:
 			with self.users_mx:
@@ -146,8 +152,7 @@ class SyncBot(object):
 			self.bot.sendMessage(chat_id, user.name + "! " + greeting)
 			if not is_new_user:
 				self.bot.sendMessage(chat_id, "Haven't seen you for " + str(elapsed_time))
-		elif msg_text[0] == "/help":
-			self.send_help_message(chat_id)
+
 		switch_timer = "Switch {0} time updates".format("off" if user.want_time else "on")
 		switch_sound = "Turn {0} notifications".format("on" if user.muted else "off")
 		keyboard = ReplyKeyboardMarkup(keyboard=[
@@ -155,40 +160,47 @@ class SyncBot(object):
 			[switch_sound],
 			["/help"]
 		])
-		self.bot.sendMessage(chat_id, str(user), reply_markup=keyboard)
-
+		if not chat_id in self.chats_to_monitor:
+			self.bot.sendMessage(chat_id, str(user), reply_markup=keyboard)
 
 	def on_chat_message(self, msg):
 		content_type, chat_type, chat_id = telepot.glance(msg)
 		flavor = telepot.flavor(msg)
-		logging.info("On chat message handler. Flavor: %s", flavor)
-		#logging.info("Message: %s", str(msg))
-		pprint(msg)
+		logging.info("On chat message handler. Flavor: %s, chat_id: %d", flavor, chat_id)
 
 		if content_type == "text":
 			if chat_id in self.chats_to_monitor:
 				self.msg_queue.put(msg)
-			if chat_type == "private":
-				self.handle_private_chat(chat_id, msg)
-			if chat_type == "group" and 'entities' in msg:
+
+			if 'entities' in msg:
 				for entity in msg['entities']:
 					if entity['type'] == "bot_command":
 						cmd = (msg["text"][entity['offset']:]).split()[0]
-						if cmd == "\help":
-							self.send_help_message()
+						if cmd == "/help":
+							self.send_help_message(chat_id)
+						elif cmd == "/start" and chat_type == "private":
+							self.handle_private_chat(chat_id, msg)
+						elif "/install_pipe" in cmd:
+							vk_chat_id = int((msg["text"][entity['offset']:]).split()[1])
+							if cmd != "/install_pipe_private":
+								vk_chat_id += self.VK_GROUP_IDS
+							self.chats_to_activate.put((chat_id, vk_chat_id, True))
+						elif cmd == "/uninstall":
+							self.chats_to_activate.put((chat_id, -1, False))
 						else:
 							logging.info("Call for unsupported command: %s", cmd)
-							self.bot.sendMessage("Unsupported command. Work in progress. Maybe. Maybe not. :grin:")
-
-
+							reply_unsupported = "Unsupported command. Work in progress. Maybe. Maybe not."
+							self.bot.sendMessage(chat_id, reply_unsupported)
+			elif chat_type == "private":
+				self.handle_private_chat(chat_id, msg)
 		else:
 			logging.warning("Unsupported message. Content type: %s\tchat type: %s", content_type, chat_type)
 
 
 class ChatMessagesHandler(db_ops.Handler):
-	def __init__(self):
-		super(ChatMessagesHandler, self).__init__()
-		self.period = dt.timedelta(seconds=13)
+	def __init__(self, db_client):
+		super(ChatMessagesHandler, self).__init__(db_client)
+		self.period = dt.timedelta(seconds=3)
 
 	def handler_hook(self, **kwargs):
 		counter = 20
@@ -197,67 +209,90 @@ class ChatMessagesHandler(db_ops.Handler):
 			msg = kwargs["msg_queue"].get()
 			content_type, chat_type, chat_id = telepot.glance(msg)
 			logging.info("ChatMessagesHandler: flushing to db msg: %s", str(msg))
-			kwargs["db_client"].add_msg(msg["message_id"], chat_id, msg["from"]["id"], msg["from"]["first_name"],
+			self.db_client.add_msg(msg["message_id"], chat_id, msg["from"]["id"], msg["from"]["first_name"],
 					msg["from"]["username"], content_type, msg["text"], msg["date"])
 
 
-class UserUpdatesHandler(db_ops.Handler):
-	def __init__(self):
-		super(UserUpdatesHandler, self).__init__()
-		self.period = dt.timedelta(seconds=25)
-
-	def handler_hook(self, **kwargs):
-		users_mx = kwargs["users_mx"]
-		users = kwargs["users"].values()
-		new_users = kwargs["new_users"]
-		db_client = kwargs["db_client"]
-
-		counter = 15
-		while not new_users.empty() and counter > 0:
-			counter -= 1
-			user = new_users.get()
-			logging.info("UserUpdatesHandler: flushing to db new user: (%d, %s)", user.id, user.name)
-			db_client.update_user(user, is_new_one=True)
-			user.dirty = False
-		if counter > 0:
-			with users_mx:
-				for user in users:
-					if user.dirty:
-						logging.info("UserUpdatesHandler: flushing to db dirty user: (%d, %s)", user.id, user.name)
-						db_client.update_user(user)
-						user.dirty = False
-
-
 class UnsyncMessagesHandler(db_ops.Handler):
-	def __init__(self):
-		super(UnsyncMessagesHandler, self).__init__()
-		self.period = dt.timedelta(seconds=11)
+	def __init__(self, db_client, bot):
+		super(UnsyncMessagesHandler, self).__init__(db_client, bot)
+		self.period = dt.timedelta(seconds=4)
 
 	def handler_hook(self, **kwargs):
-		db_client = kwargs["db_client"]
-		bot = kwargs["bot"]
-		for row_dict in db_client.fetch_unsync_messages():
+		counter = 3
+		for row_dict in self.db_client.fetch_unsync_messages():
+			counter -= 1
 			logging.info("Sending unsync message: %s ", str(row_dict))
 			msg_time = dt.datetime.fromtimestamp(row_dict["date"]).strftime('%H:%M:%S')
 			msg_text = "{0} ({1}), {2}: {3}".format(row_dict["sender_name"].encode('utf-8'),
 					row_dict["username"].encode('utf-8'), msg_time, row_dict["content"].encode('utf-8'))
-			bot.sendMessage(row_dict["tg_chat_id"], msg_text)
+			chat_id = row_dict["tg_chat_id"]
+			if not self.api.is_hitting_limits(chat_id) and counter > 0:
+				self.api.sendMessage(chat_id, msg_text)
+				row_dict['sent'] = True
+				time.sleep(1)
+			else:
+				break
 
 
 class TimeNotificationHandler(db_ops.Handler):
-	def __init__(self):
-		super(TimeNotificationHandler, self).__init__()
+	def __init__(self, bot):
+		super(TimeNotificationHandler, self).__init__(api=bot)
 		self.period = dt.timedelta(seconds=20)
 
 	def handler_hook(self, **kwargs):
 		users = kwargs["users"]
-		bot = kwargs["bot"]
 		for id, user in users.iteritems():
 				if user.want_time:
 					logging.info("TimeNotificationHandler: sending time to (%d, %s) ...",  id, user.name)
-					bot.sendMessage(id, "Current time: <b>" + str(dt.datetime.now().time().strftime('%H:%M:%S')) +
+					self.api.sendMessage(id, "Current time: <b>" + str(dt.datetime.now().time().strftime('%H:%M:%S')) +
 							"</b>", disable_notification=user.muted, parse_mode="html")
 
+
+class PipeControlHandler(db_ops.Handler):
+	def __init__(self, db_client, control_msg_q, bot):
+		super(PipeControlHandler, self).__init__(db_client, bot)
+		self.period = dt.timedelta(seconds=5)
+		self.control_msg_q = control_msg_q
+
+	def handler_hook(self, **kwargs):
+		while not self.control_msg_q.empty():
+			tg_chat_id, vk_chat_id, want_install = self.control_msg_q.get()
+			logging.info("PipeControlHandler: request for a pipe update: tg:%d <> vk:%d, is_new_one (%d)",
+					tg_chat_id, vk_chat_id, want_install)
+			if want_install:
+				activation_code = '/' +  ''.join(random.choice
+						(string.ascii_uppercase + string.ascii_lowercase + string.digits) for _ in range(8))
+				try:
+					self.db_client.set_pending_chat(tg_chat_id, vk_chat_id, activation_code)
+				except Exception as e:
+					logging.error("PipeControlHandler: cannot setup pending chat. Reason: %s", e.message)
+				confirmation = "Please confirm the pipe on the other end by sending the following confirmation code: "
+				self.api.sendMessage(tg_chat_id, confirmation + activation_code)
+			else:
+				self.db_client.remove_pipe(tg_chat_id)
+		return self.db_client.get_monitored_chats()
+
+
+class LimitsAwareBot(telepot.Bot):
+	ALLOWED_PER_MIN = 20
+
+	def __init__(self, *args, **kwargs):
+		super(LimitsAwareBot, self).__init__(*args, **kwargs)
+		self.outpost_timings = {}
+
+	def is_hitting_limits(self, chat_id):
+		if chat_id not in self.outpost_timings:
+			self.outpost_timings[chat_id] = collections.deque([dt.datetime.fromtimestamp(0)] * 20)
+		return (dt.datetime.now() - self.outpost_timings[chat_id][-1]).seconds < 1 \
+				or (dt.datetime.now() - self.outpost_timings[chat_id][-self.ALLOWED_PER_MIN]).seconds < 60
+
+	def sendMessage(self, chat_id, *args, **kwargs):
+		super(LimitsAwareBot, self).sendMessage(chat_id, *args, **kwargs)
+		if chat_id not in self.outpost_timings:
+			self.outpost_timings[chat_id] = collections.deque([dt.datetime.fromtimestamp(0)] * 20)
+		self.outpost_timings[chat_id].append(dt.datetime.now())
+		self.outpost_timings[chat_id].popleft()
 
 
 if __name__ == "__main__":
@@ -265,14 +300,11 @@ if __name__ == "__main__":
 
 	token_f = open("_token")
 	_token = token_f.readline()
-	if _token[-1] == '\n':
-		_token = _token[:-1]
+	_token = _token.replace('\n', '')
 
 	bot = SyncBot(_token)
 
 	bot.start()
 
-
-
-
+	bot.db_client.close()
 
