@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# Author: Ivan Senin
+
 import calendar
 import time
 import datetime as dt

@@ -4,7 +4,6 @@
 import Queue
 import datetime as dt
 import logging
-import random
 import requests
 import threading
 import time
@@ -57,13 +56,19 @@ class SyncVkNode(object):
 					server = res_d['server']
 					key = res_d['key']
 					ts = res_d['ts']
-				except Exception as e:
+				except BaseException as e:
 					self.logger.exception("Unable to get new long-poll keys. Reason: %s", e.message)
 					time.sleep(3)
 
 			url = "https://{0}?act=a_check&key={1}&ts={2}&wait=25&mode=2".format(server, key, ts)
-			req = requests.get(url)
-			answer = req.json()
+			try:
+				req = requests.get(url)
+				answer = req.json()
+			except BaseException as e:
+				self.logger.exception("Long-poll request failure. Reason: %s;\tReply: %s", e.message, str(req))
+				time.sleep(SLEEP_SECONDS)
+				continue
+
 			if 'failed' in answer:
 				if answer['failed'] == INVALID_VERSION:
 					self.logger.error("Unexpected error. longpoll retured fail-4")
@@ -188,8 +193,8 @@ class ChatHandler(db_ops.Handler):
 		try:
 			self.find_sender_for_group_msgs(group_msgs)
 			self.get_users_by_id([msg['user_id'] for msg in messages])
-		except vk_requests.exceptions.VkAPIError as e:
-			self.logger.error("Cannot get additional information about group messages. Reason: %s", e.message)
+		except BaseException as e:
+			self.logger.exception("Cannot get additional information about group messages. Reason: %s", e.message)
 			# saving group messages back to queue. Hope to successfully save them within next iteration
 			for g_msg in group_msgs:
 				self.msg_q.put(g_msg)
@@ -243,6 +248,8 @@ class UnsyncMessagesHandler(db_ops.Handler):
 					if msg[0] == "Flood":
 						self.api.messages.send(peer_id=target_chat, chat_id=target_chat,
 								message="<Banned by flood control>")
+				except BaseException as be:
+					self.logger.exception("Unexpected exception: %s", be.message)
 
 
 class PipeUpdatesHandler(db_ops.Handler):
@@ -269,22 +276,27 @@ class PipeUpdatesHandler(db_ops.Handler):
 
 
 class UsersObservationHandle(db_ops.Handler):
-	PERIOD_BASE_MINUTES = 5
-	PERIOD_MAX_DELTA_MINUTES = 25
+	MINUTES_FRACTION = 10
 
 	def __init__(self, db_client, api, users_d):
 		super(UsersObservationHandle, self).__init__(db_client, api)
-		self.period = dt.timedelta(minutes=self.PERIOD_BASE_MINUTES)
 		self.logger = logging.getLogger(__name__)
+		self.last_observation = dt.datetime.fromtimestamp(0)
 		self.users_d = users_d
 
-	def update_handler_period(self):
-		in_minutes = self.PERIOD_BASE_MINUTES + random.randint(0, self.PERIOD_MAX_DELTA_MINUTES)
-		self.period = dt.timedelta(minutes=in_minutes)
+	def is_time_to_go(self, current_time):
+		return 0 == current_time.minute % self.MINUTES_FRACTION and \
+				current_time > self.last_observation + dt.timedelta(minutes=2)
 
 	def handler_hook(self, **kwargs):
-		friends_info = self.api.friends.get(fields="online, domain")['items']
 		users_mx = kwargs['users_mx']
+		try:
+			friends_info = self.api.friends.get(fields="online, domain")['items']
+		except BaseException as be:
+			self.logger.exception("UsersObservationHandle: Unexpected exception: %s", be.message)
+			self.logger.warning("Observation was skipped")
+			return
+
 		users_to_state_d = {}
 		new_users_l = []
 		for j_user in friends_info:
@@ -302,16 +314,19 @@ class UsersObservationHandle(db_ops.Handler):
 			users_to_state_d[user] = (is_online, using_mobile)
 		self.db_client.update_user(new_users_l, is_new_ones=True)
 		self.db_client.append_users_observations(users_to_state_d)
+		self.last_observation = dt.datetime.now()
 
-		self.update_handler_period()
-		self.logger.info("UsersObservationHandle: next observation will be in %d minutes", self.period.seconds / 60)
+		# stats
+		total_num = len(users_to_state_d.keys())
+		online_num = len(filter(lambda pair: pair[0], users_to_state_d.values()))
+		using_mobile = len(filter(lambda pair: pair[1], users_to_state_d.values()))
+		self.logger.info("UsersObservationHandle: %d of %d are online. %.1f%s use mobile app", online_num, total_num,
+				(float(using_mobile * 100) / online_num), "%")
 
 
 if __name__ == "__main__":
 	logging.basicConfig(format='%(asctime)s:%(levelname)s:%(name)s:%(message)s', level=logging.INFO)
 	logging.getLogger('requests').setLevel(logging.WARNING)
-
-	random.seed((dt.datetime.now() - dt.datetime.fromtimestamp(0)).seconds)
 
 	credits_f = open("vk_credits")
 	app_id = credits_f.readline().replace('\n', '')

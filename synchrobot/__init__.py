@@ -12,7 +12,8 @@ import sync_tg_bot
 import sync_vk_app
 
 MAX_SHORT_PERIOD_FAILS = 3
-SHORT_PERIOD = dt.timedelta(seconds=30)
+SHORT_PERIOD = dt.timedelta(seconds=40)
+WATCHDOG_PROBE_PERIOD_SECONDS = 10
 
 def start_pipe_watchdog(tg_token_path, vk_token_path, log_filename = ""):
 	assert os.path.exists(vk_token_path), "The path to vk credentials is broken"
@@ -43,28 +44,34 @@ def start_pipe_watchdog(tg_token_path, vk_token_path, log_filename = ""):
 			bot.start(stop_signals_q)
 
 	last_fails = collections.deque([dt.datetime.fromtimestamp(0)] * MAX_SHORT_PERIOD_FAILS)
-
-	while dt.datetime.now() > last_fails[-MAX_SHORT_PERIOD_FAILS] + SHORT_PERIOD:
-		try:
-			vk_thread = threading.Thread(target=vk_process)
-			vk_thread.daemon = True
-			tg_thread = threading.Thread(target=telegram_process)
-			tg_thread.daemon = True
-
-			vk_thread.start()
+	vk_thread = None
+	tg_thread = None
+	try:
+		while dt.datetime.now() > last_fails[-MAX_SHORT_PERIOD_FAILS] + SHORT_PERIOD:
+			if vk_thread is None or not vk_thread.isAlive():
+				vk_thread = threading.Thread(target=vk_process)
+				vk_thread.daemon = True
+				vk_thread.start()
 			time.sleep(2)
-			tg_thread.start()
-			while True:
-				time.sleep(5)
+			if tg_thread is None or not tg_thread.isAlive():
+				tg_thread = threading.Thread(target=telegram_process)
+				tg_thread.daemon = True
+				tg_thread.start()
 
-		except BaseException as e:
+			time.sleep(WATCHDOG_PROBE_PERIOD_SECONDS)
+
+			if not vk_thread.isAlive() or not tg_thread.isAlive():
+				logging.warning("Failure of was detected. vk state: %d; tg state: %d",
+						vk_thread.isAlive(), tg_thread.isAlive())
+				last_fails.append(dt.datetime.now())
+				last_fails.popleft()
+	except BaseException as e:
 			if isinstance(e, KeyboardInterrupt):
-				logging.info("Session was interrupted by user. Sending stop-event... Please wait")
-				stop_signals_q.put("stop")
 				sleep_seconds = 5
+				stop_signals_q.put("stop")
+				logging.info("Session was interrupted by user. Sending stop-event... Please wait %d seconds",
+						sleep_seconds)
 				time.sleep(sleep_seconds)
-				break
-			logging.error("Unexpected exception. Message: %s", e.message)
-			last_fails.append(dt.datetime.now())
-			last_fails.popleft()
-	logging.info("Exit")
+			else:
+				logging.exception("Unexpected exception in watchdog: %s", e.message)
+	logging.info("Full application exit")

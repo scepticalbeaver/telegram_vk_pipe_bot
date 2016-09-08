@@ -76,7 +76,7 @@ class SyncBot(object):
 				self.bot.message_loop({'chat': self.on_chat_message, 'inline_query': self.on_inline_query,
 									'chosen_inline_result': self.on_chosen_inline_result})
 				connected = True
-			except Exception as e:
+			except BaseException as e:
 				self.logger.exception("Bot startup failed. Guess: %s", e.message)
 				error_counter += 1
 		if not connected:
@@ -277,10 +277,14 @@ class PipeControlHandler(db_ops.Handler):
 						(string.ascii_uppercase + string.ascii_lowercase + string.digits) for _ in range(8))
 				try:
 					self.db_client.set_pending_chat(tg_chat_id, vk_chat_id, activation_code)
+					reply_text = "Please confirm the pipe on the other end by sending the following confirmation code:"\
+							" " + activation_code
+				except UserWarning as w:
+					reply_text = "The pipe is already exist. Maybe you want `/uninstall` first?"
 				except Exception as e:
 					self.logger.exception("PipeControlHandler: cannot setup pending chat. Reason: %s", e.message)
-				confirmation = "Please confirm the pipe on the other end by sending the following confirmation code: "
-				self.api.sendMessage(tg_chat_id, confirmation + activation_code)
+					reply_text = "Unsuccessful operation"
+				self.api.sendMessage(tg_chat_id, reply_text)
 			else:
 				self.db_client.remove_pipe(tg_chat_id)
 		return self.db_client.get_monitored_chats()

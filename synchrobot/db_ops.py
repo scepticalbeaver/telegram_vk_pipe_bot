@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # Author: Ivan Senin
 
@@ -153,7 +152,12 @@ class DBClient(object):
 		assert self.__platform == "tg", "Pipe could be established only from telegram"
 		assert isinstance(code, str), "activation code must be a string"
 		c = self.conn.cursor()
-		c.execute("INSERT INTO msg_pipe VALUES(NULL, ?, ?, 0, ?)", (tg_chat_id, vk_chat_id, code))
+		try:
+			c.execute("INSERT INTO msg_pipe VALUES(NULL, ?, ?, 0, ?)", (tg_chat_id, vk_chat_id, code))
+		except sqlite3.IntegrityError as ie:
+			self.logger.warning("IntegrityError: %s", ie.message)
+			if ie.message.split()[0] == "UNIQUE":
+				raise UserWarning("UNIQUE")
 		self.conn.commit()
 
 	def get_pending_chat_ids(self):
@@ -200,7 +204,7 @@ class DBClient(object):
 
 class Handler(object):
 	def __init__(self, db_client=None, api=None):
-		self.period = None  # you must set this in inherited class
+		self.period = None  # you must set this timedelta in inherited class or override is_time_to_go method
 		self.time_to_go = dt.datetime.now()
 		self.db_client = db_client
 		self.api = api
@@ -208,11 +212,16 @@ class Handler(object):
 	def handler_hook(self, **kwargs):
 		pass
 
+	def is_time_to_go(self, current_time):
+		assert not self.period is None, "You must set self.period value or override is_time_to_go method"
+		return current_time > self.time_to_go
+
 	def __call__(self, *args, **kwargs):
 		# Do not override this method. Use a hook
-		if dt.datetime.now() > self.time_to_go:
+		if self.is_time_to_go(dt.datetime.now()):
 			result = self.handler_hook(**kwargs)
-			self.time_to_go = dt.datetime.now() + self.period
+			if self.period:
+				self.time_to_go = dt.datetime.now() + self.period
 			return result
 
 
