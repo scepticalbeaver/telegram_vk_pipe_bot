@@ -1,39 +1,41 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+# Author: Ivan Senin
+import Queue
 import datetime as dt
 import logging
 import random
 import requests
 import threading
 import time
-import Queue
 
 import vk_requests
 import vk_requests.exceptions
 from vk_requests.auth import VKSession
 
-import db_ops
-from chat_user import User
+from synchrobot import db_ops
+from synchrobot.chat_user import User
 
 
 class SyncVkNode(object):
-	NEW_MESSAGE = 4
+	NEW_MESSAGE_ID = 4
 
 	def __init__(self, app_id, token):
-		self.app_id = 5611494
+		self.logger = logging.getLogger(__name__)
+		self.app_id = app_id
 		self.__token = token
 
 		session = VKSession(app_id=app_id)
 		session.access_token = token
 		self._api = vk_requests.API(session)
 		self._api.friends.get()  # test
-		logging.info("vk connection established")
+		self.logger.info("vk connection established")
 
 		self.db_client = db_ops.DBClient("vk")
 		self.users_d = self.db_client.fetch_users()
 		self.users_d_mx = threading.Lock()
 		self.chats_to_monitor = []
-		logging.info("%d chatd_ids to monitor were fetched from db", len(self.chats_to_monitor))
+		self.logger.info("%d chatd_ids to monitor were fetched from db", len(self.chats_to_monitor))
 		self.msg_queue = Queue.Queue(100)
 		self.outbox_msg_ids = []
 		self.outbox_msg_ids_mx = threading.Lock()
@@ -50,13 +52,13 @@ class SyncVkNode(object):
 		while True:
 			if key is None:
 				try:
-					logging.info("Getting new keys for a long-poll...")
+					self.logger.info("Getting new keys for a long-poll...")
 					res_d = self._api.messages.getLongPollServer(need_pts=0)
 					server = res_d['server']
 					key = res_d['key']
 					ts = res_d['ts']
 				except Exception as e:
-					logging.warning("Unable to get new long-poll keys. Reason: %s", e.message)
+					self.logger.exception("Unable to get new long-poll keys. Reason: %s", e.message)
 					time.sleep(3)
 
 			url = "https://{0}?act=a_check&key={1}&ts={2}&wait=25&mode=2".format(server, key, ts)
@@ -64,7 +66,7 @@ class SyncVkNode(object):
 			answer = req.json()
 			if 'failed' in answer:
 				if answer['failed'] == INVALID_VERSION:
-					logging.error("Unexpected error. longpoll retured fail-4")
+					self.logger.error("Unexpected error. longpoll retured fail-4")
 					raise ValueError("LongPoll resulted in FAIL-4")
 				key = None  # forces to get new keys
 				continue
@@ -72,7 +74,7 @@ class SyncVkNode(object):
 			updates = answer['updates']
 
 			for update in updates:
-				if update[0] == self.NEW_MESSAGE:
+				if update[0] == self.NEW_MESSAGE_ID:
 					msg_d = {'message_id': update[1],
 						'flags': update[2],
 						'from_id': update[3],
@@ -84,13 +86,13 @@ class SyncVkNode(object):
 						elif msg_d['from_id'] in self.pending_chats_d.keys() and msg_d['text']:
 							code = msg_d['text'].split()[0]
 							if code == self.pending_chats_d[msg_d['from_id']]:
-								logging.info("_start_longpoll_handler: found activation code match")
+								self.logger.info("_start_longpoll_handler: found activation code match")
 								self.chats_to_activate_q.put((msg_d['from_id'], code))
 
 			time.sleep(SLEEP_SECONDS)
 
-	def __event_loop(self):
-		logging.info("Starting event loop")
+	def __event_loop(self, stop_signal_q):
+		self.logger.info("Starting event loop")
 		new_msg_handler = ChatHandler(self.db_client, self._api, self.msg_queue, self.users_d, self.users_d_mx,
 				 self.outbox_msg_ids, self.outbox_msg_ids_mx)
 		foreign_msg_handler = UnsyncMessagesHandler(self.db_client, self._api, self.outbox_msg_ids,
@@ -100,9 +102,9 @@ class SyncVkNode(object):
 
 		try:
 			sleep_seconds = 0.3
-			while True:
+			while stop_signal_q.empty():
 				res = chats_state_handler(outbox_msg_ids_mx=self.outbox_msg_ids_mx, outbox_msg_ids=self.outbox_msg_ids)
-				if res:
+				if not res is None:
 					self.chats_to_monitor, self.pending_chats_d = res
 				new_msg_handler()
 				foreign_msg_handler()
@@ -110,14 +112,17 @@ class SyncVkNode(object):
 
 				time.sleep(sleep_seconds)
 		except KeyboardInterrupt:
-			logging.info("Event loop was interrupted by user")
+			self.logger.info("Event loop was interrupted by user")
 
-	def start(self):
+	def start(self, stop_signal_q = Queue.Queue()):
 		collector_thread = threading.Thread(target=self._start_longpoll_handler)
 		collector_thread.daemon = True
 		collector_thread.start()
 
-		self.__event_loop()
+		self.__event_loop(stop_signal_q)
+		self.db_client.close()
+		if not stop_signal_q.empty():
+			self.logger.info("Execution was stopped via stop-event")
 
 
 class ChatHandler(db_ops.Handler):
@@ -126,6 +131,7 @@ class ChatHandler(db_ops.Handler):
 	def __init__(self, db_client, api, msg_queue, users_d, users_d_mx, outbox_msg_ids, outbox_msg_ids_mx):
 		super(ChatHandler, self).__init__(db_client, api)
 		self.period = dt.timedelta(seconds=3)
+		self.logger = logging.getLogger(__name__)
 		self.msg_q = msg_queue
 		self.users_d = users_d
 		self.users_d_mx = users_d_mx
@@ -135,7 +141,7 @@ class ChatHandler(db_ops.Handler):
 	def get_users_by_id(self, ids):
 		if not ids:
 			return
-		logging.info("ChatHandler: fetched users' information...")
+		self.logger.info("ChatHandler: fetching users' information...")
 		users_info = self.api.users.get(user_ids=filter(lambda id: id not in self.users_d.keys(), ids),
 				fields='domain')
 
@@ -146,7 +152,7 @@ class ChatHandler(db_ops.Handler):
 			with self.users_d_mx:
 				self.users_d[id] = new_user
 			new_users_l.append(new_user)
-			logging.info("ChatHandler: flushing new user to db: (%s, %s)", new_user.username, new_user.name)
+			self.logger.info("ChatHandler: flushing new user to db: (%s, %s)", new_user.username, new_user.name)
 		self.db_client.update_user(new_users_l, is_new_ones=True)
 
 	def find_sender_for_group_msgs(self, group_msgs):
@@ -154,7 +160,7 @@ class ChatHandler(db_ops.Handler):
 			return
 		full_msgs_info = self.api.messages.getById(
 				message_ids=[msg['message_id'] for msg in group_msgs], preview_length=1)['items']
-		logging.info("Requested msgs from group chats %s", str(full_msgs_info))
+		self.logger.info("Requested msgs from group chats %s", str(full_msgs_info))
 		for msg in group_msgs:
 			msg['user_id'] = (filter(lambda msg_: msg_['id'] == msg['message_id'], full_msgs_info)[0])['user_id']
 
@@ -183,14 +189,14 @@ class ChatHandler(db_ops.Handler):
 			self.find_sender_for_group_msgs(group_msgs)
 			self.get_users_by_id([msg['user_id'] for msg in messages])
 		except vk_requests.exceptions.VkAPIError as e:
-			logging.error("Cannot get additional information about group messages. Reason: %s", e.message)
+			self.logger.error("Cannot get additional information about group messages. Reason: %s", e.message)
 			# saving group messages back to queue. Hope to successfully save them within next iteration
 			for g_msg in group_msgs:
 				self.msg_q.put(g_msg)
 				messages.remove(g_msg)
 
 		for msg in messages:
-			logging.info("ChatHandler: flushing to db msg: %s", str(msg))
+			self.logger.info("ChatHandler: flushing to db msg: %s", str(msg))
 			self.db_client.add_msg(
 					msg_id=msg['message_id'],
 					chat_id=msg['from_id'],
@@ -206,6 +212,7 @@ class UnsyncMessagesHandler(db_ops.Handler):
 	def __init__(self, db_client, api, outbox_msg_ids, outbox_msg_ids_mx):
 		super(UnsyncMessagesHandler, self).__init__(db_client, api)
 		self.period = dt.timedelta(seconds=4)
+		self.logger = logging.getLogger(__name__)
 		self.outbox_msg_ids = outbox_msg_ids
 		self.outbox_msg_ids_mx = outbox_msg_ids_mx
 		self.send_counter = 3
@@ -215,7 +222,7 @@ class UnsyncMessagesHandler(db_ops.Handler):
 		for row_dict in self.db_client.fetch_unsync_messages():
 			with self.send_counter_mx:
 				self.send_counter -= 1
-			logging.info("Sending unsync message: %s ", str(row_dict))
+			self.logger.info("Sending unsync message: %s ", str(row_dict))
 			msg_time = dt.datetime.fromtimestamp(row_dict["date"]).strftime('%H:%M:%S')
 			msg_text = "{0} ({1}), {2}: {3}".format(row_dict["sender_name"].encode('utf-8'),
 					row_dict["username"].encode('utf-8'), msg_time, row_dict["content"].encode('utf-8'))
@@ -231,7 +238,7 @@ class UnsyncMessagesHandler(db_ops.Handler):
 						self.outbox_msg_ids.append(new_msg_id)
 					row_dict['sent'] = True
 				except vk_requests.exceptions.VkAPIError as e:
-					logging.error("UnsyncMessagesHandler: vk api error: %s; text: %s", e.message, msg_text)
+					self.logger.error("UnsyncMessagesHandler: vk api error: %s; text: %s", e.message, msg_text)
 					msg = e.message.split()
 					if msg[0] == "Flood":
 						self.api.messages.send(peer_id=target_chat, chat_id=target_chat,
@@ -242,6 +249,7 @@ class PipeUpdatesHandler(db_ops.Handler):
 	def __init__(self, db_client, chats_to_update_q, api):
 		super(PipeUpdatesHandler, self).__init__(db_client, api)
 		self.period = dt.timedelta(seconds=3)
+		self.logger = logging.getLogger(__name__)
 		self.chats_to_update_q = chats_to_update_q
 
 	def handler_hook(self, **kwargs):
@@ -250,7 +258,7 @@ class PipeUpdatesHandler(db_ops.Handler):
 			for row_dict in self.db_client.check_pending_chats(code):
 				if row_dict['vk_chat_id'] == vk_chat_id:
 					row_dict['confirmed'] = True
-					logging.info("PipeUpdatesHandler: chat %d confirmed", vk_chat_id)
+					self.logger.info("PipeUpdatesHandler: chat %d confirmed", vk_chat_id)
 					outbox_msg_id = self.api.messages.send(peer_id=vk_chat_id, message="The pipe is confirmed")
 					with kwargs['outbox_msg_ids_mx']:
 						kwargs['outbox_msg_ids'].append(outbox_msg_id)
@@ -267,6 +275,7 @@ class UsersObservationHandle(db_ops.Handler):
 	def __init__(self, db_client, api, users_d):
 		super(UsersObservationHandle, self).__init__(db_client, api)
 		self.period = dt.timedelta(minutes=self.PERIOD_BASE_MINUTES)
+		self.logger = logging.getLogger(__name__)
 		self.users_d = users_d
 
 	def update_handler_period(self):
@@ -286,7 +295,7 @@ class UsersObservationHandle(db_ops.Handler):
 				with users_mx:
 					self.users_d[id] = user
 				new_users_l.append(user)
-				logging.info("ChatHandler: flushing new user to db: (%s, %s)", user.username, user.name)
+				self.logger.info("ChatHandler: flushing new user to db: (%s, %s)", user.username, user.name)
 			user = self.users_d[id]
 			is_online = j_user['online'] == 1
 			using_mobile = "online_mobile" in j_user.keys()
@@ -295,11 +304,12 @@ class UsersObservationHandle(db_ops.Handler):
 		self.db_client.append_users_observations(users_to_state_d)
 
 		self.update_handler_period()
-		logging.info("UsersObservationHandle: next observation will be in %d minutes", self.period.seconds / 60)
+		self.logger.info("UsersObservationHandle: next observation will be in %d minutes", self.period.seconds / 60)
 
 
 if __name__ == "__main__":
-	logging.basicConfig(format='vk side: %(asctime)s %(message)s', level=logging.INFO)
+	logging.basicConfig(format='%(asctime)s:%(levelname)s:%(name)s:%(message)s', level=logging.INFO)
+	logging.getLogger('requests').setLevel(logging.WARNING)
 
 	random.seed((dt.datetime.now() - dt.datetime.fromtimestamp(0)).seconds)
 

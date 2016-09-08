@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+# Author: Ivan Senin
 
 import calendar
 import datetime as dt
@@ -8,21 +9,22 @@ import os
 import sqlite3
 import time
 
-from chat_user import User
+from synchrobot.chat_user import User
 
 
 class DBClient(object):
-	DB_NAME = 'ip_sink_data.db'
+	DB_NAME = 'pipe_data.db'
 	SUPPORTED_PLATFORMS = ["vk", "tg"]
 
 	def __init__(self, bot_platform):
 		assert bot_platform in self.SUPPORTED_PLATFORMS, "Unsupported platform"
 		self.__platform = bot_platform
+		self.logger = logging.getLogger(__name__ + "(" +self.__platform + ")")
 		have_saved_data = os.path.isfile(self.DB_NAME)
-		logging.info("Connecting to %s ...", DBClient.DB_NAME)
+		self.logger.info("Connecting to %s ...", DBClient.DB_NAME)
 		self.conn = sqlite3.connect(DBClient.DB_NAME)
 		if not have_saved_data:
-			logging.info("%s doesn't exist. Creating new one ...", self.DB_NAME)
+			self.logger.info("%s doesn't exist. Creating new one ...", self.DB_NAME)
 			self.create_fresh_db()
 
 	def create_fresh_db(self):
@@ -35,7 +37,7 @@ class DBClient(object):
 			c.execute('''DROP TABLE online_stats''')
 			self.conn.commit()
 		except Exception as e:
-			logging.error("Failed to drop tables. Reason: %s", e.message)
+			self.logger.warning("Failed to drop tables. Reason: %s", e.message)
 
 		c.execute('''CREATE TABLE users
 					(user_id INT NOT NULL,
@@ -73,9 +75,8 @@ class DBClient(object):
 					using_mobile BOOLEAN NOT NULL,
 					timing DATE NOT NULL)''')
 
-
 		self.conn.commit()
-		logging.info("Brand new tables were created")
+		self.logger.info("Brand new tables were created")
 
 	def update_user(self, users, is_new_ones=False):
 		if not users:
@@ -96,6 +97,7 @@ class DBClient(object):
 				          " WHERE user_id = ? AND platform = ?",
 				          (user.name, user.last_seen, user.want_time, user.muted, user.id, self.__platform))
 		self.conn.commit()
+		self.logger.info("%d users were flushed to db", len(users))
 
 	def fetch_users(self):
 		c = self.conn.cursor()
@@ -193,6 +195,7 @@ class DBClient(object):
 
 	def close(self):
 		self.conn.close()
+		self.logger.info("Connection to %s closed", self.DB_NAME)
 
 
 class Handler(object):
@@ -217,6 +220,7 @@ class UserUpdatesHandler(Handler):
 	def __init__(self, db_client, users_d):
 		super(UserUpdatesHandler, self).__init__(db_client)
 		self.period = dt.timedelta(seconds=20)
+		self.logger = logging.getLogger(__name__)
 		self.users = users_d.values()
 
 	def handler_hook(self, **kwargs):
@@ -228,7 +232,7 @@ class UserUpdatesHandler(Handler):
 		while not new_users.empty() and counter > 0:
 			counter -= 1
 			user = new_users.get()
-			logging.info("UserUpdatesHandler: flushing to db new user: (%d, %s)", user.id, user.name)
+			self.logger.info("UserUpdatesHandler: flushing to db new user: (%d, %s)", user.id, user.name)
 			user.dirty = False
 			new_users_l.append(user)
 		self.db_client.update_user(new_users_l, is_new_ones=True)
@@ -236,6 +240,6 @@ class UserUpdatesHandler(Handler):
 		with users_mx:
 			users_to_update = filter(lambda user: user.dirty, self.users)[:max(0, counter)]
 			for user in users_to_update:
-				logging.info("UserUpdatesHandler: flushing to db dirty user: (%d, %s)", user.id, user.name)
+				self.logger.info("UserUpdatesHandler: flushing to db dirty user: (%d, %s)", user.id, user.name)
 				user.dirty = False
 			self.db_client.update_user(users_to_update)
