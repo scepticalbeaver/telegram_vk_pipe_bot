@@ -24,6 +24,7 @@ class SyncBot(object):
 
 	greetings_next = ["Hello again!", "Good to see you again!", "How's it going?", "How are you doing?", "What's up?",
                   "Pleased to meet you again!"]
+	LONGPOLL_RETRY_RELAX_SECONDS = .7
 	VK_GROUP_IDS = 2000000000
 
 	def __init__(self, token):
@@ -71,10 +72,11 @@ class SyncBot(object):
 	def start(self, stop_signal_q = Queue.Queue()):
 		error_counter = 0
 		connected = False
+		dispatch = {'chat': self.on_chat_message, 'inline_query': self.on_inline_query,
+				'chosen_inline_result': self.on_chosen_inline_result}
 		while not connected and error_counter < 5:
 			try:
-				self.bot.message_loop({'chat': self.on_chat_message, 'inline_query': self.on_inline_query,
-									'chosen_inline_result': self.on_chosen_inline_result})
+				self.bot.message_loop(callback=dispatch, relax=self.LONGPOLL_RETRY_RELAX_SECONDS)
 				connected = True
 			except BaseException as e:
 				self.logger.exception("Bot startup failed. Guess: %s", e.message)
@@ -208,7 +210,7 @@ class SyncBot(object):
 class ChatMessagesHandler(db_ops.Handler):
 	def __init__(self, db_client):
 		super(ChatMessagesHandler, self).__init__(db_client)
-		self.period = dt.timedelta(seconds=3)
+		self.period = dt.timedelta(seconds=2)
 		self.logger = logging.getLogger(__name__)
 
 	def handler_hook(self, **kwargs):
@@ -238,7 +240,8 @@ class UnsyncMessagesHandler(db_ops.Handler):
 					row_dict["username"].encode('utf-8'), msg_time, row_dict["content"].encode('utf-8'))
 			chat_id = row_dict["tg_chat_id"]
 			if not self.api.is_hitting_limits(chat_id) and counter > 0:
-				self.api.sendMessage(chat_id, msg_text)
+				if not self.api.sendMessage(chat_id, msg_text):
+					return
 				row_dict['sent'] = True
 				time.sleep(1)
 			else:
@@ -295,6 +298,7 @@ class LimitsAwareBot(telepot.Bot):
 
 	def __init__(self, *args, **kwargs):
 		super(LimitsAwareBot, self).__init__(*args, **kwargs)
+		self.logger = logging.getLogger(__name__)
 		self.outpost_timings = {}
 
 	def is_hitting_limits(self, chat_id):
@@ -304,11 +308,22 @@ class LimitsAwareBot(telepot.Bot):
 				or (dt.datetime.now() - self.outpost_timings[chat_id][-self.ALLOWED_PER_MIN]).seconds < 60
 
 	def sendMessage(self, chat_id, *args, **kwargs):
-		super(LimitsAwareBot, self).sendMessage(chat_id, *args, **kwargs)
+		"""
+		:return: True if a deliver was successful, False otherwise
+		"""
+		try:
+			super(LimitsAwareBot, self).sendMessage(chat_id, *args, **kwargs)
+		except telepot.exception.TelepotException as e:
+			self.logger.error("Cannot deliver a message. Reason: %s", e.message)
+			return False
+		except BaseException as be:
+			self.logger.exception("Unexpected excepton: %s", be.message)
+			return False
 		if chat_id not in self.outpost_timings:
 			self.outpost_timings[chat_id] = collections.deque([dt.datetime.fromtimestamp(0)] * 20)
 		self.outpost_timings[chat_id].append(dt.datetime.now())
 		self.outpost_timings[chat_id].popleft()
+		return True
 
 
 if __name__ == "__main__":
@@ -321,5 +336,3 @@ if __name__ == "__main__":
 	bot = SyncBot(_token)
 
 	bot.start()
-
-

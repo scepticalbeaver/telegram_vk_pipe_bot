@@ -4,9 +4,10 @@
 import calendar
 import time
 import datetime as dt
+import json
 
 class User(object):
-	def __init__(self, id, name, last_seen, want_time, muted, username=""):
+	def __init__(self, id, name, last_seen, want_time, muted, username="", additional_keys="{}"):
 		super(User, self).__init__()
 		self.id = id
 		self.name = name
@@ -15,6 +16,7 @@ class User(object):
 		self._want_time = want_time
 		self._muted = muted
 		self.dirty = True
+		self.other_keys = json.loads(additional_keys) if additional_keys else {}
 
 	def get_seen(self): return self._last_seen
 
@@ -44,7 +46,10 @@ class User(object):
 	def __str__(self):
 		seen_str = dt.datetime.fromtimestamp(self.last_seen).strftime('%Y-%m-%d %H:%M:%S')
 
-		return "User: ({0} ({1}), id: {2}, last_seen: {3}, want_time: {4}, muted: {5})".format(
-				self.name.encode('utf-8'), self.username, self.id, seen_str, self.want_time, self.muted)
+		return "User: ({0}{1}, id: {2}, last_seen: {3}, want_time: {4}, muted: {5})".format(
+				self.name.encode('utf-8'), " (" + self.username + ")" if self.username else "", self.id, seen_str,
+				self.want_time, self.muted)
 
+	def serialized_keys(self):
+		return json.dumps(self.other_keys)
 

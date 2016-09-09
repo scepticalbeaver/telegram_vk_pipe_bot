@@ -4,6 +4,7 @@
 import calendar
 import datetime as dt
 import logging
+import numpy as np
 import os
 import sqlite3
 import time
@@ -46,6 +47,7 @@ class DBClient(object):
 					mute_dialog BOOLEAN,
 					platform TEXT CHECK(platform = 'vk' or platform = 'tg'),
 					username TEXT,
+					other_keys TEXT,
 					PRIMARY KEY (user_id, platform))''')
 
 		c.execute('''CREATE TABLE messages
@@ -88,13 +90,14 @@ class DBClient(object):
 		c = self.conn.cursor()
 		for user in users:
 			if is_new_ones:
-				c.execute("INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?)",
+				c.execute("INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
 						(user.id, user.name, user.last_seen, user.want_time, user.muted, self.__platform,
-						 user.username))
+						 user.username, user.serialized_keys()))
 			else:
-				c.execute("UPDATE users SET name = ?, last_contact_date = ?, want_time = ?, mute_dialog = ?" +
-				          " WHERE user_id = ? AND platform = ?",
-				          (user.name, user.last_seen, user.want_time, user.muted, user.id, self.__platform))
+				c.execute('''UPDATE users SET name = ?, last_contact_date = ?, want_time = ?, mute_dialog = ?,
+				          other_keys = ?  WHERE user_id = ? AND platform = ?''',
+						(user.name, user.last_seen, user.want_time, user.muted, user.serialized_keys(),
+						user.id, self.__platform))
 		self.conn.commit()
 		self.logger.info("%d users were flushed to db", len(users))
 
@@ -108,7 +111,8 @@ class DBClient(object):
 			want_time = bool(row[3])
 			muted = bool(row[4])
 			username = row[6]
-			users[id] = User(id, name, last_seen, want_time, muted, username)
+			json_keys = row[7]
+			users[id] = User(id, name, last_seen, want_time, muted, username, json_keys)
 			users[id].dirty = False
 		return users
 
@@ -196,6 +200,19 @@ class DBClient(object):
 		for user, (is_online, using_mobile) in users_to_state_d.iteritems():
 			c.execute("INSERT INTO online_stats VALUES (?, ?, ?, ?)", (user.id, is_online, using_mobile, current_ts))
 		self.conn.commit()
+
+	def get_user_statistics(self, user):
+		"""
+		:return: numpy.matrix with columns (dt.datetime, is_online, using_mobile) for a given user
+		"""
+		assert isinstance(user, User)
+		c = self.conn.cursor()
+		c.execute("SELECT timing, is_online, using_mobile FROM online_stats WHERE user_id = ?", (user.id,))
+		rows = c.fetchall()
+		if not rows:
+			return np.matrix([])
+		cast_to_datetime = lambda tup: [dt.datetime.fromtimestamp(tup[0]), tup[1], tup[2]]
+		return np.apply_along_axis(cast_to_datetime, 1,  np.matrix(rows))
 
 	def close(self):
 		self.conn.close()

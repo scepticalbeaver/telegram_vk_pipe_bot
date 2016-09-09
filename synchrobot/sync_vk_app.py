@@ -14,7 +14,9 @@ from vk_requests.auth import VKSession
 
 from synchrobot import db_ops
 from synchrobot.chat_user import User
+import stats_processing
 
+_WATCHES_FOR = "watches_for"
 
 class SyncVkNode(object):
 	NEW_MESSAGE_ID = 4
@@ -32,15 +34,130 @@ class SyncVkNode(object):
 
 		self.db_client = db_ops.DBClient("vk")
 		self.users_d = self.db_client.fetch_users()
+		self.logger.info("%d users were fetched from db", len(self.users_d.keys()))
 		self.users_d_mx = threading.Lock()
-		self.chats_to_monitor = []
+
+		self.chats_to_monitor = self.db_client.get_monitored_chats()
 		self.logger.info("%d chatd_ids to monitor were fetched from db", len(self.chats_to_monitor))
+		self.monitoring_mx = threading.Lock()
+
 		self.msg_queue = Queue.Queue(100)
+		self.new_users_q = Queue.Queue()
 		self.outbox_msg_ids = []
 		self.outbox_msg_ids_mx = threading.Lock()
-		self.monitoring_mx = threading.Lock()
 		self.chats_to_activate_q = Queue.Queue()
-		self.pending_chats_d = {}
+		self.pending_chats_d = self.db_client.get_pending_chat_ids()
+		self.request_for_stats_q = Queue.Queue()
+		self.extend_vk_api()
+
+	def extend_vk_api(self):
+		self._api.fetch_users_from_web = self.fetch_users_from_web
+		self._api.get_user_objects = self.get_user_objects
+
+	def fetch_users_from_web(self, ids, overwrite_users=False):
+		"""
+		unsafe, exceptions could be thrown
+		:return list if fetched users as `User` objects
+		"""
+		if not ids:
+			return []
+		if isinstance(ids, int) or isinstance(ids, basestring):
+			ids = [ids]
+		assert isinstance(ids, list) and (isinstance(ids[0], int) or isinstance(ids[0], basestring)), "Type error"
+		self.logger.info("fetching users' information via web...")
+		try:
+			users_info = self._api.users.get(user_ids= ids,	fields='domain')
+		except BaseException as e:
+			self.logger.exception("Cannot fetch users from vk. Reason: %s", e.message)
+			return
+
+		result = []
+		for user_info in users_info:
+			id = user_info['id']
+			if id in self.users_d.keys() and not overwrite_users:
+				continue
+			new_user = User(id, user_info['first_name'], 0, False, False, user_info['domain'])
+			with self.users_d_mx:
+				self.users_d[id] = new_user
+			result.append(new_user)
+			self.new_users_q.put(new_user)
+		return result
+
+	def get_user_objects(self, ids):
+		"""
+		:param ids: integer or username, can be list of it
+		:return: chat_user.User object or list in unsorted order
+		"""
+		result = []
+		unknown_ids = []
+		if not ids:
+			return result
+		if isinstance(ids, int) or isinstance(ids, basestring):
+			ids = [ids]
+		for id in ids:
+			if isinstance(id, int):
+				if id in self.users_d.keys():
+					result.append(self.users_d[id])
+				else:
+					unknown_ids.append(id)
+			elif isinstance(ids, basestring):
+				with self.users_d_mx:
+					if id in [user.username for user in self.users_d.values()]:
+						result.append( filter(lambda u: u.username == id, self.users_d.values())[0] )
+					else:
+						unknown_ids.append(id)
+		result.extend(self.fetch_users_from_web(unknown_ids))
+		res_size = len(result)
+		if res_size != len(ids):
+			self.logger.warning("Number of requested users ({0}) does not match the number of returned ones ({1})",
+					len(ids), res_size)
+		return result[0] if res_size == 1 else result
+
+	def find_by_username(self, username):
+		with self.users_d_mx:
+			result = filter(lambda user: user.username == username, self.users_d.values())
+		return result[0] if len(result) == 1 else result
+
+
+	def on_chat_message(self, msg_d):
+		GROUP_IDS = 2000000000
+		words = [s.lower() for s in msg_d['text'].split()]
+		is_private = msg_d['from_id'] < GROUP_IDS
+		if "/stats" in words[:1] and msg_d['from_id'] > 0 and is_private:
+			source = self.get_user_objects(msg_d['from_id'])
+			target = source.id
+			user = source
+			if len(words) > 1:
+				try:
+					target = int(words[1])
+					user = self.users_d[target] if target in self.users_d.keys() else None
+				except:
+					user = self.find_by_username(words[1])
+
+			reply = ""
+			now = dt.datetime.now()
+			dt_relax = dt.timedelta(minutes=1)
+			next_attempt_time = dt.datetime.fromtimestamp(source.last_seen) + dt_relax
+			if not user:
+				reply = "No statistics for user or broken name {0}.\n".format(words[1]) + \
+						"Usage: /stats [id|username]\nwhere id is integer (e.g. `/stats 1` or `/stats durov`)" \
+						"Type: `/stats` to watch statistics for yourself"
+			elif now > next_attempt_time:
+				self.request_for_stats_q.put((source, user))
+				reply = "Assembling statistics for {0}...".format(now.isoformat('/'))
+			elif source.want_time:
+				seconds_rest = (next_attempt_time - now).seconds
+				reply = "Please have a rest for {0} seconds".format(seconds_rest)
+				source.want_time = False
+
+
+
+
+			if reply:
+				try:
+					self._api.messages.send(peer_id=source.id, message=reply)
+				except BaseException as e:
+					self.logger.exception("Cannot send message to the user. Reason: %s", e.message)
 
 	def _start_longpoll_handler(self):
 		INVALID_VERSION = 4
@@ -56,6 +173,7 @@ class SyncVkNode(object):
 					server = res_d['server']
 					key = res_d['key']
 					ts = res_d['ts']
+					self.logger.info("Got keys. Success")
 				except BaseException as e:
 					self.logger.exception("Unable to get new long-poll keys. Reason: %s", e.message)
 					time.sleep(3)
@@ -65,13 +183,14 @@ class SyncVkNode(object):
 				req = requests.get(url)
 				answer = req.json()
 			except BaseException as e:
-				self.logger.exception("Long-poll request failure. Reason: %s;\tReply: %s", e.message, str(req))
+				self.logger.exception("Long-poll request failure. Reason: %s", e.message)
 				time.sleep(SLEEP_SECONDS)
 				continue
 
 			if 'failed' in answer:
+				self.logger.warning("Received `fail` from long-poll reply")
 				if answer['failed'] == INVALID_VERSION:
-					self.logger.error("Unexpected error. longpoll retured fail-4")
+					self.logger.error("Bad stuff: longpoll retured fail- %d", INVALID_VERSION)
 					raise ValueError("LongPoll resulted in FAIL-4")
 				key = None  # forces to get new keys
 				continue
@@ -84,26 +203,34 @@ class SyncVkNode(object):
 						'flags': update[2],
 						'from_id': update[3],
 						'timestamp': update[4],
-						'text': update[6]}
+						'text': update[6],
+						'attachments': update[7]}
+					has_handled = False
 					with self.monitoring_mx:
 						if msg_d['from_id'] in self.chats_to_monitor:
 							self.msg_queue.put(msg_d)
+							has_handled = True
 						elif msg_d['from_id'] in self.pending_chats_d.keys() and msg_d['text']:
 							code = msg_d['text'].split()[0]
 							if code == self.pending_chats_d[msg_d['from_id']]:
 								self.logger.info("_start_longpoll_handler: found activation code match")
 								self.chats_to_activate_q.put((msg_d['from_id'], code))
+								has_handled = True
+					if not has_handled:
+						self.on_chat_message(msg_d)
 
 			time.sleep(SLEEP_SECONDS)
 
 	def __event_loop(self, stop_signal_q):
 		self.logger.info("Starting event loop")
-		new_msg_handler = ChatHandler(self.db_client, self._api, self.msg_queue, self.users_d, self.users_d_mx,
-				 self.outbox_msg_ids, self.outbox_msg_ids_mx)
+		new_msg_handler = ChatHandler(self.db_client, self._api, self.msg_queue, self.users_d, self.outbox_msg_ids,
+				self.outbox_msg_ids_mx)
 		foreign_msg_handler = UnsyncMessagesHandler(self.db_client, self._api, self.outbox_msg_ids,
 				self.outbox_msg_ids_mx)
 		chats_state_handler = PipeUpdatesHandler(self.db_client, self.chats_to_activate_q, self._api)
-		users_observer = UsersObservationHandle(self.db_client, self._api, self.users_d)
+		user_updates_handler = db_ops.UserUpdatesHandler(self.db_client, self.users_d)
+		users_observer = UsersObservationHandler(self.db_client, self._api, self.users_d)
+		statistics_processor = StatisticsProcessor(self.db_client, self._api, self.request_for_stats_q)
 
 		try:
 			sleep_seconds = 0.3
@@ -114,6 +241,8 @@ class SyncVkNode(object):
 				new_msg_handler()
 				foreign_msg_handler()
 				users_observer(users_mx=self.users_d_mx)
+				statistics_processor()
+				user_updates_handler(users_mx=self.users_d_mx, new_users=self.new_users_q)
 
 				time.sleep(sleep_seconds)
 		except KeyboardInterrupt:
@@ -133,32 +262,14 @@ class SyncVkNode(object):
 class ChatHandler(db_ops.Handler):
 	MAX_CACHED_USERS = 500
 
-	def __init__(self, db_client, api, msg_queue, users_d, users_d_mx, outbox_msg_ids, outbox_msg_ids_mx):
+	def __init__(self, db_client, api, msg_queue, users_d, outbox_msg_ids, outbox_msg_ids_mx):
 		super(ChatHandler, self).__init__(db_client, api)
 		self.period = dt.timedelta(seconds=3)
 		self.logger = logging.getLogger(__name__)
 		self.msg_q = msg_queue
 		self.users_d = users_d
-		self.users_d_mx = users_d_mx
 		self.outbox_msg_ids = outbox_msg_ids
 		self.outbox_msg_ids_mx = outbox_msg_ids_mx
-
-	def get_users_by_id(self, ids):
-		if not ids:
-			return
-		self.logger.info("ChatHandler: fetching users' information...")
-		users_info = self.api.users.get(user_ids=filter(lambda id: id not in self.users_d.keys(), ids),
-				fields='domain')
-
-		new_users_l = []
-		for user_info in users_info:
-			id = user_info['id']
-			new_user = User(id, user_info['first_name'], 0, False, False, user_info['domain'])
-			with self.users_d_mx:
-				self.users_d[id] = new_user
-			new_users_l.append(new_user)
-			self.logger.info("ChatHandler: flushing new user to db: (%s, %s)", new_user.username, new_user.name)
-		self.db_client.update_user(new_users_l, is_new_ones=True)
 
 	def find_sender_for_group_msgs(self, group_msgs):
 		if not group_msgs:
@@ -192,7 +303,7 @@ class ChatHandler(db_ops.Handler):
 
 		try:
 			self.find_sender_for_group_msgs(group_msgs)
-			self.get_users_by_id([msg['user_id'] for msg in messages])
+			self.api.fetch_users_from_web([msg['user_id'] for msg in messages])
 		except BaseException as e:
 			self.logger.exception("Cannot get additional information about group messages. Reason: %s", e.message)
 			# saving group messages back to queue. Hope to successfully save them within next iteration
@@ -275,11 +386,11 @@ class PipeUpdatesHandler(db_ops.Handler):
 		return chats_to_monitor, pending_chats_d
 
 
-class UsersObservationHandle(db_ops.Handler):
+class UsersObservationHandler(db_ops.Handler):
 	MINUTES_FRACTION = 10
 
 	def __init__(self, db_client, api, users_d):
-		super(UsersObservationHandle, self).__init__(db_client, api)
+		super(UsersObservationHandler, self).__init__(db_client, api)
 		self.logger = logging.getLogger(__name__)
 		self.last_observation = dt.datetime.fromtimestamp(0)
 		self.users_d = users_d
@@ -290,29 +401,23 @@ class UsersObservationHandle(db_ops.Handler):
 
 	def handler_hook(self, **kwargs):
 		users_mx = kwargs['users_mx']
+		with users_mx:
+			users_to_watch = map(lambda u: u.id, filter(lambda u: not u.muted, self.users_d.values()))
+
 		try:
-			friends_info = self.api.friends.get(fields="online, domain")['items']
+			users_info = self.api.users.get(user_ids=users_to_watch, fields="online")
 		except BaseException as be:
-			self.logger.exception("UsersObservationHandle: Unexpected exception: %s", be.message)
+			self.logger.exception("UsersObservationHandler: Unexpected exception: %s", be.message)
 			self.logger.warning("Observation was skipped")
 			return
 
 		users_to_state_d = {}
-		new_users_l = []
-		for j_user in friends_info:
+		for j_user in users_info:
 			id = j_user['id']
-			if id not in self.users_d: # new user
-				user = User(id, j_user['first_name'], 0, False, False, j_user['domain'])
-				user.dirty = False
-				with users_mx:
-					self.users_d[id] = user
-				new_users_l.append(user)
-				self.logger.info("ChatHandler: flushing new user to db: (%s, %s)", user.username, user.name)
 			user = self.users_d[id]
 			is_online = j_user['online'] == 1
 			using_mobile = "online_mobile" in j_user.keys()
 			users_to_state_d[user] = (is_online, using_mobile)
-		self.db_client.update_user(new_users_l, is_new_ones=True)
 		self.db_client.append_users_observations(users_to_state_d)
 		self.last_observation = dt.datetime.now()
 
@@ -320,8 +425,85 @@ class UsersObservationHandle(db_ops.Handler):
 		total_num = len(users_to_state_d.keys())
 		online_num = len(filter(lambda pair: pair[0], users_to_state_d.values()))
 		using_mobile = len(filter(lambda pair: pair[1], users_to_state_d.values()))
-		self.logger.info("UsersObservationHandle: %d of %d are online. %.1f%s use mobile app", online_num, total_num,
+		self.logger.info("UsersObservationHandler: %d of %d are online. %.1f%s use mobile app", online_num, total_num,
 				(float(using_mobile * 100) / online_num), "%")
+
+
+class StatisticsProcessor(db_ops.Handler):
+	RELAX_PERIOD = dt.timedelta(minutes=1)
+	def __init__(self, db_client, api, pending_users_q):
+		super(StatisticsProcessor, self).__init__(db_client, api)
+		self.period = dt.timedelta(seconds=1)
+		self.logger = logging.getLogger(__name__)
+		self.pending_users_q = pending_users_q
+
+	def upload_image(self, filename):
+		import pprint as pp
+		# step 1: Get server
+		try:
+			upload_server = self.api.photos.getMessagesUploadServer()
+			assert 'upload_url' in upload_server
+		except BaseException as e:
+			self.logger.error("Cannot get photos' servername. Reason: %s", e.message)
+			return
+		# step 2: post image
+		image = {'photo': open(filename, 'rb')}
+		try:
+			req = requests.post(url=upload_server['upload_url'], files=image)
+			answer = req.json()
+		except BaseException as e:
+			self.logger.error("Cannot upload image. Reason: %s", e.message)
+			return
+		ans_photo_decoded = answer['photo'].decode('string-escape')
+		# step 3: save image
+		try:
+			image_d = self.api.photos.saveMessagesPhoto(photo=ans_photo_decoded, server=answer['server'],
+					hash=answer['hash'])
+		except BaseException as e:
+			self.logger.error("Cannot save uploaded photo. Reason: %s", e.message)
+			return
+		return image_d[0]
+
+
+	def handler_hook(self, **kwargs):
+		if self.pending_users_q.empty():
+			return
+		client_user, target_user = self.pending_users_q.get()
+		if dt.datetime.now() < dt.datetime.fromtimestamp(client_user.last_seen) + self.RELAX_PERIOD:
+			return
+		try:
+			self.api.messages.setActivity(user_id=target_user.id, type="typing", peer_id=client_user.id)
+		except BaseException as e:
+			self.logger.warning("Cannot set typing activity. Reason: %s", e.message)
+
+		start_time = time.time()
+		stats = self.db_client.get_user_statistics(target_user)
+		if 0 == max(stats.shape):
+			reply = "No statistics on user %s".format(str(target_user))
+			self.api.messages.send(peer_id=client_user.id, message=reply)
+		stats_filename = stats_processing.make_attendance_plot(stats, target_user)
+		end_time = time.time()
+		elapsed = end_time - start_time
+		self.logger.info("Statistics plot was generated within %.2f seconds. File: %s", elapsed, stats_filename)
+
+		# upload photo to vk
+		start_time = time.time()
+		image_d = self.upload_image(stats_filename)
+		if not image_d:
+			return
+		end_time = time.time()
+		elapsed = end_time - start_time
+		self.logger.info("Image was uploaded to a server within %.2f seconds", elapsed)
+
+		reply_text = "Statistics of {0}".format(target_user.username)
+		payload = "photo{0}_{1}".format(image_d['owner_id'], image_d['id'])
+
+		try:
+			self.api.messages.send(peer_id=client_user.id, message=reply_text, attachment=payload)
+		except BaseException as e:
+			self.logger.error("Cannot send message with statistics. Reason: %s", e.message)
+		client_user.update_seen_time()
+		client_user.want_time = True
 
 
 if __name__ == "__main__":

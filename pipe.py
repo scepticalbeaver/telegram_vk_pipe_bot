@@ -27,14 +27,4 @@ parser.add_argument("--log", dest="log_filename", type=str, default="", metavar=
 
 args = parser.parse_args()
 
-
-print args.log_filename
-
 synchrobot.start_pipe_watchdog(args.tg_token_file, args.vk_token_file, args.log_filename)
-
-
-
-
-
-
-
