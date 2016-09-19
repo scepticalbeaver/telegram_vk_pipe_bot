@@ -72,7 +72,7 @@ class SyncBot(object):
 	def start(self, stop_signal_q = Queue.Queue()):
 		error_counter = 0
 		connected = False
-		dispatch = {'chat': self.on_chat_message, 'inline_query': self.on_inline_query,
+		dispatch = {'chat': self.on_chat_message, 'edited_chat': self.on_edited_message, 'inline_query': self.on_inline_query,
 				'chosen_inline_result': self.on_chosen_inline_result}
 		while not connected and error_counter < 5:
 			try:
@@ -205,6 +205,10 @@ class SyncBot(object):
 				self.handle_private_chat(chat_id, msg)
 		else:
 			self.logger.warning("Unsupported message. Content type: %s\tchat type: %s", content_type, chat_type)
+
+	def on_edited_message(self, msg):
+		content_type, chat_type, chat_id = telepot.glance(msg)
+		self.logger.warning("Edited message ignored. Chat id: %d", chat_id)
 
 
 class ChatMessagesHandler(db_ops.Handler):

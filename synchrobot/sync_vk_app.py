@@ -177,6 +177,7 @@ class SyncVkNode(object):
 				except BaseException as e:
 					self.logger.exception("Unable to get new long-poll keys. Reason: %s", e.message)
 					time.sleep(3)
+					ontinue
 
 			url = "https://{0}?act=a_check&key={1}&ts={2}&wait=25&mode=2".format(server, key, ts)
 			try:
@@ -425,8 +426,9 @@ class UsersObservationHandler(db_ops.Handler):
 		total_num = len(users_to_state_d.keys())
 		online_num = len(filter(lambda pair: pair[0], users_to_state_d.values()))
 		using_mobile = len(filter(lambda pair: pair[1], users_to_state_d.values()))
+		mobile_fraction = float(using_mobile * 100) / online_num if online_num else 0
 		self.logger.info("UsersObservationHandler: %d of %d are online. %.1f%s use mobile app", online_num, total_num,
-				(float(using_mobile * 100) / online_num), "%")
+				(mobile_fraction), "%")
 
 
 class StatisticsProcessor(db_ops.Handler):

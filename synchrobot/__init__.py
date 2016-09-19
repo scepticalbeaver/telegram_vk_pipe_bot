@@ -61,7 +61,7 @@ def start_pipe_watchdog(tg_token_path, vk_token_path, log_filename = ""):
 				vk_thread.daemon = True
 				logging.info("Starting up vk...")
 				vk_thread.start()
-			time.sleep(2)
+				time.sleep(2)
 			if tg_thread is None or not tg_thread.isAlive():
 				tg_thread = threading.Thread(target=telegram_process)
 				tg_thread.daemon = True
