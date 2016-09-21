@@ -1,13 +1,13 @@
 # Telegram <-> Vk pipe
-The primary aim is to commute people, who like to chat in a specific platform.
-A pipe couple be established between group chats and private chats as well.
+The primary aim is to commute people, who prefer to chat within a specific platform.
+A pipe could be established between group chats and private chats as well.
 
-Telegram bot handles all the control. Ask him for [/help](tg://bot_command?command=help) for further info. 
+Telegram bot handles all the control. Ask him for [`/help`](tg://bot_command?command=help) for further info. 
 
-Also, telegram and vk sides have additional functionality.
-Telegram bot is capable to process inline queries. That way you could send into an arbitraty chat a random famouse quote via [@Synchrobot](https://web.telegram.org/#/im?p=%40synchrobot).
+Also, telegram and vk sides both have additional functionality.
+Telegram bot is capable to process inline queries. That way you could send into an arbitraty chat a random famous quote via [@Synchrobot](https://web.telegram.org/#/im?p=%40synchrobot).
 
-On the other hand, vk side is able to track users' online stats. Ontain stats by sending `/stats` to the vk client.
+On the other hand, vk side is able to track users' online stats. Ontain stats by sending `/stats` or `/stats username` to the vk client.
 
 ## Usage
 ```
@@ -26,7 +26,7 @@ optional arguments:
 
 ## Implementation notes
 
-All messages are dumped to sqlite db by client and then pulled by other side client. Implementation based on standart sql syntax which allows easily migrate into a solid client-server DBMS. 
+All messages are dumped into sqlite db by client and then pulled by other side client. The implementation is based on standart sql syntax which allows easily migrate into a solid client-server DBMS. 
 
 The application is highly fault tolerant and makes lot of attempts to restart in case of unexpected crash. Many server API errors are handled on a regular basis.
 

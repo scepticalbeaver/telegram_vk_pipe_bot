@@ -223,6 +223,7 @@ class SyncVkNode(object):
 			time.sleep(SLEEP_SECONDS)
 
 	def __event_loop(self, stop_signal_q):
+		collector_thread = None
 		self.logger.info("Starting event loop")
 		new_msg_handler = ChatHandler(self.db_client, self._api, self.msg_queue, self.users_d, self.outbox_msg_ids,
 				self.outbox_msg_ids_mx)
@@ -246,14 +247,15 @@ class SyncVkNode(object):
 				user_updates_handler(users_mx=self.users_d_mx, new_users=self.new_users_q)
 
 				time.sleep(sleep_seconds)
+				if collector_thread is None or not collector_thread.isAlive():
+					self.logger.info("Starting longpoll handler...")
+					collector_thread = threading.Thread(target=self._start_longpoll_handler)
+					collector_thread.daemon = True
+					collector_thread.start()
 		except KeyboardInterrupt:
 			self.logger.info("Event loop was interrupted by user")
 
 	def start(self, stop_signal_q = Queue.Queue()):
-		collector_thread = threading.Thread(target=self._start_longpoll_handler)
-		collector_thread.daemon = True
-		collector_thread.start()
-
 		self.__event_loop(stop_signal_q)
 		self.db_client.close()
 		if not stop_signal_q.empty():

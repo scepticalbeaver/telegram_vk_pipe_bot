@@ -25,7 +25,7 @@ def start_pipe_watchdog(tg_token_path, vk_token_path, log_filename = ""):
 	logging.basicConfig(format=FORMAT, level=logging.INFO)
 	logging.getLogger('requests').setLevel(logging.WARNING)
 	if log_filename:
-		max_log_size_bytes = 50 * 1024 * 1024 # 50 Mb
+		max_log_size_bytes = 21 * 1024 * 1024 # 21 Mb
 		fhandler = logging.handlers.RotatingFileHandler(filename=log_filename,
 				mode="w", maxBytes=max_log_size_bytes, backupCount=1)
 		file_formatter = logging.Formatter(FORMAT)
